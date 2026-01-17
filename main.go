@@ -10,12 +10,13 @@ func main() {
 	flag.Parse()
 
 	stopch := make(chan struct{})
-	app, err := NewApplication(*url, *logFile, *dbfile, *keyCount)
+	// No longer need to pass noun/adj file paths
+	app, err := NewApplication(*logFile, *dbfile, *keyCount)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	app.Logger.Println("Starting nomenclator")
+	app.Logger.Println("Starting nomenclator (embedded local mode)")
 	go app.Run(stopch)
 	<-stopch
 	app.Logger.Println("Stopping nomenclator")
@@ -27,5 +28,4 @@ func main() {
 		}
 	}
 	fmt.Println("Complete")
-
 }

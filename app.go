@@ -2,17 +2,24 @@ package main
 
 import (
 	"crypto/rand"
+	"embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
+	mrand "math/rand"
 	"os"
+	"strings"
 	"sync"
+	"time"
 
 	"go.etcd.io/bbolt"
 )
+
+//go:embed data
+var content embed.FS
 
 var (
 	jsonOut  = flag.Bool("jsonout", false, "Output to json")
@@ -20,25 +27,24 @@ var (
 	jsonFile = flag.String("json", "nomenclator.json", "JSON file")
 	logFile  = flag.String("log", "nomenclator.log", "Log file")
 	keyCount = flag.Int("keycount", 100, "Number of keys to generate")
-	url      = flag.String("url", "http://fairlady:8080/", "nomenclator api url")
-	// url      = flag.String("url", "http://localhost:8080/", "nomenclator api url")
 )
 
 type Application struct {
-	JsonData []Pair
-	InFlight int
-	Complete int
-	Count    int
-	URL      string
-	Logger   *log.Logger
-	Client   *http.Client
-	Memory   *sync.RWMutex
-	DB       *bbolt.DB
-	NameChan chan NameResponse
+	JsonData   []Pair
+	InFlight   int
+	Complete   int
+	Count      int
+	Logger     *log.Logger
+	Memory     *sync.RWMutex
+	DB         *bbolt.DB
+	Adjectives []string
+	Nouns      []string
+	UsedNames  map[string]bool
 }
 
-type NameResponse struct {
-	Data string `json:"data"`
+type Pair struct {
+	Name string `json:"name"`
+	Key  []byte `json:"key"`
 }
 
 func (a *Application) AddPair(name string, key []byte) {
@@ -61,7 +67,7 @@ func (a *Application) SaveJSON() error {
 	return enc.Encode(a.JsonData)
 }
 
-func NewApplication(url, logfile, dbfile string, count int) (*Application, error) {
+func NewApplication(logfile, dbfile string, count int) (*Application, error) {
 	logger, err := newLogger(logfile)
 	if err != nil {
 		return nil, err
@@ -71,17 +77,45 @@ func NewApplication(url, logfile, dbfile string, count int) (*Application, error
 	if err != nil {
 		return nil, err
 	}
-	namech := make(chan NameResponse, 100)
+
+	// Load words from the embedded filesystem
+	adjs, err := loadWords("data/adj.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to load adjectives: %v", err)
+	}
+	nouns, err := loadWords("data/noun.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to load nouns: %v", err)
+	}
+
+	mrand.Seed(time.Now().UnixNano())
 
 	return &Application{
-		Count:    count,
-		NameChan: namech,
-		URL:      url,
-		Logger:   logger,
-		Client:   &http.Client{},
-		Memory:   &sync.RWMutex{},
-		DB:       db,
+		Count:      count,
+		Logger:     logger,
+		Memory:     &sync.RWMutex{},
+		DB:         db,
+		Adjectives: adjs,
+		Nouns:      nouns,
+		UsedNames:  make(map[string]bool),
 	}, nil
+}
+
+func loadWords(path string) ([]string, error) {
+	// Read from the embedded variable 'content' instead of os.ReadFile
+	fileBytes, err := content.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	words := strings.Fields(string(fileBytes))
+
+	var cleanWords []string
+	for _, w := range words {
+		if !strings.Contains(w, "[") && !strings.Contains(w, "]") {
+			cleanWords = append(cleanWords, w)
+		}
+	}
+	return cleanWords, nil
 }
 
 func MakeKey() ([]byte, error) {
@@ -108,48 +142,34 @@ func newDB(dbfile string) (*bbolt.DB, error) {
 	return db, nil
 }
 
-func (a *Application) GeKeyName() {
-	req, err := http.NewRequest("GET", a.URL, nil)
-	if err != nil {
-		a.Logger.Println("Error creating request: ", err)
-		return
+func (a *Application) GenerateUniqueName() (string, error) {
+	maxRetries := 1000
+	for i := 0; i < maxRetries; i++ {
+		adj := a.Adjectives[mrand.Intn(len(a.Adjectives))]
+		noun := a.Nouns[mrand.Intn(len(a.Nouns))]
+		name := fmt.Sprintf("%s-%s", adj, noun)
+
+		if !a.UsedNames[name] {
+			a.UsedNames[name] = true
+			return name, nil
+		}
 	}
-	resp, err := a.Client.Do(req)
-	if err != nil {
-		a.Logger.Println("Error sending request", err)
-		return
-	}
-	defer resp.Body.Close()
-	var name NameResponse
-	if err := json.NewDecoder(resp.Body).Decode(&name); err != nil {
-		a.Logger.Println("Error decoding response", err)
-		return
-	}
-	a.Logger.Println("Received name: ", name.Data)
-	a.NameChan <- name
+	return "", errors.New("failed to generate unique name after many retries")
 }
 
-type Pair struct {
-	Name string `json:"name"`
-	Key  []byte `json:"key"`
-}
-
-func (a *Application) PairAndSaveKey(name NameResponse) error {
-	// name := <-a.NameChan
+func (a *Application) PairAndSaveKey(name string) error {
 	key, err := MakeKey()
 	if err != nil {
 		a.Logger.Println("Error generating key: ", err)
 		return err
 	}
-	a.AddPair(name.Data, key)
+	a.AddPair(name, key)
 	if err := a.DB.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte("keys"))
 		if err != nil {
 			return err
 		}
-		// this is called key but not really a key, it's a value
-		// a.Logger.Println("Saving key: ", key, name.Data)
-		return bucket.Put([]byte(name.Data), key)
+		return bucket.Put([]byte(name), key)
 	}); err != nil {
 		a.Logger.Println("Error saving key: ", err)
 		return err
@@ -158,22 +178,37 @@ func (a *Application) PairAndSaveKey(name NameResponse) error {
 }
 
 func (a *Application) Run(stop chan struct{}) {
-	for {
+	a.Logger.Println("Generating names and keys...")
+
+	totalCombos := len(a.Adjectives) * len(a.Nouns)
+	if a.Count > totalCombos {
+		fmt.Printf("Warning: Requested %d keys but only %d unique name combinations are possible.\n", a.Count, totalCombos)
+	}
+
+	for a.Complete < a.Count {
 		select {
 		case <-stop:
 			a.Logger.Println("Shutting down")
 			return
 		default:
-			if a.Complete == a.Count {
+			name, err := a.GenerateUniqueName()
+			if err != nil {
+				a.Logger.Println("Generation stopped:", err)
+				fmt.Println("Error:", err)
 				stop <- struct{}{}
 				return
 			}
-			a.InFlight++
-			fmt.Println("InFlight: ", a.InFlight, "Complete: ", a.Complete, "Count: ", a.Count)
-			go a.GeKeyName()
-			name := <-a.NameChan
-			a.PairAndSaveKey(name)
+			a.Logger.Println("Generated name: ", name)
+
+			if err := a.PairAndSaveKey(name); err != nil {
+				a.Logger.Println("Error processing pair:", err)
+				continue
+			}
+
 			a.Complete++
+			fmt.Printf("Processed: %d / %d\r", a.Complete, a.Count)
 		}
 	}
+	fmt.Println()
+	stop <- struct{}{}
 }
